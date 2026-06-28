@@ -34,19 +34,34 @@ async function verifyUser(req, res, next) {
     const token = header.replace("Bearer ", "");
 
     if (!token) {
-      return res.status(401).json({
-        success: false,
-        message: "No autorizado"
-      });
+      return res.status(401).json({ success: false, message: "No autorizado" });
     }
 
     const decoded = await authAdmin.verifyIdToken(token);
     req.uid = decoded.uid;
     next();
   } catch {
-    return res.status(401).json({
+    return res.status(401).json({ success: false, message: "Token inválido" });
+  }
+}
+
+async function verifyAdmin(req, res, next) {
+  try {
+    const snap = await db.collection("users").doc(req.uid).get();
+
+    if (!snap.exists || !snap.data().isAdmin) {
+      return res.status(403).json({
+        success: false,
+        message: "No eres admin"
+      });
+    }
+
+    req.admin = snap.data();
+    next();
+  } catch {
+    return res.status(500).json({
       success: false,
-      message: "Token inválido"
+      message: "Error verificando admin"
     });
   }
 }
@@ -57,11 +72,10 @@ function generateReferralCode(email) {
     .replace(/[^a-zA-Z0-9]/g, "")
     .toUpperCase();
 
-  const random = Math.floor(100000 + Math.random() * 900000);
-  return `REWA${base}${random}`;
+  return `REWA${base}${Math.floor(100000 + Math.random() * 900000)}`;
 }
 
-function addHistory(tx, uid, description, coins, type = "general") {
+function addHistory(tx, uid, description, coins, type = "general", extra = {}) {
   const ref = db.collection("transactions").doc();
 
   tx.set(ref, {
@@ -69,16 +83,18 @@ function addHistory(tx, uid, description, coins, type = "general") {
     description,
     coins,
     type,
+    ...extra,
     createdAt: FieldValue.serverTimestamp()
   });
 }
 
-async function addHistoryDirect(uid, description, coins, type = "general") {
+async function addHistoryDirect(uid, description, coins, type = "general", extra = {}) {
   await db.collection("transactions").add({
     uid,
     description,
     coins,
     type,
+    ...extra,
     createdAt: FieldValue.serverTimestamp()
   });
 }
@@ -87,6 +103,13 @@ app.get("/", (req, res) => {
   res.json({
     success: true,
     message: "REWAFREE backend activo"
+  });
+});
+
+app.post("/api/admin/check", verifyUser, verifyAdmin, async (req, res) => {
+  res.json({
+    success: true,
+    message: "Admin verificado"
   });
 });
 
@@ -384,6 +407,10 @@ app.post("/api/referral/use", verifyUser, async (req, res) => {
   }
 });
 
+/* =========================
+   CANJE NORMAL
+========================= */
+
 app.post("/api/withdraw/request", verifyUser, async (req, res) => {
   try {
     const uid = req.uid;
@@ -469,24 +496,144 @@ app.post("/api/withdraw/request", verifyUser, async (req, res) => {
   }
 });
 
-app.post("/api/admin/withdraw/paid", verifyUser, async (req, res) => {
+/* =========================
+   CANJE AUTOMÁTICO DE CÓDIGOS
+========================= */
+
+app.post("/api/rewards/redeem-code", verifyUser, async (req, res) => {
   try {
     const uid = req.uid;
+    const rewardId = String(req.body.rewardId || "").trim();
+
+    if (!rewardId) {
+      return res.status(400).json({
+        success: false,
+        message: "Falta rewardId"
+      });
+    }
+
+    const userRef = db.collection("users").doc(uid);
+    const cardRef = db.collection("giftcards").doc(rewardId);
+
+    let deliveredCode = null;
+    let deliveredName = null;
+
+    await db.runTransaction(async tx => {
+      const userSnap = await tx.get(userRef);
+      const cardSnap = await tx.get(cardRef);
+
+      if (!userSnap.exists) throw new Error("Usuario no existe");
+      if (!cardSnap.exists) throw new Error("Código no existe");
+
+      const user = userSnap.data();
+      const card = cardSnap.data();
+
+      if (user.banned) throw new Error("Cuenta bloqueada");
+      if (card.used) throw new Error("Este código ya fue usado");
+
+      const coins = Number(user.coins || 0);
+      const cost = Number(card.coinsCost || 0);
+
+      if (!cost || cost < 1) throw new Error("Costo inválido");
+      if (coins < cost) throw new Error("No tienes monedas suficientes");
+
+      deliveredCode = card.code;
+      deliveredName = card.name;
+
+      tx.update(userRef, {
+        coins: FieldValue.increment(-cost)
+      });
+
+      tx.update(cardRef, {
+        used: true,
+        usedBy: uid,
+        usedByEmail: user.email || "",
+        usedAt: FieldValue.serverTimestamp()
+      });
+
+      const redeemRef = db.collection("redemptions").doc();
+
+      tx.set(redeemRef, {
+        uid,
+        email: user.email || "",
+        giftcardId: rewardId,
+        type: card.type || "",
+        name: card.name || "",
+        value: card.value || "",
+        coinsCost: cost,
+        code: card.code || "",
+        status: "delivered",
+        createdAt: FieldValue.serverTimestamp()
+      });
+
+      addHistory(
+        tx,
+        uid,
+        `Código entregado: ${card.name || "Gift Card"}`,
+        -cost,
+        "giftcard",
+        {
+          giftcardId: rewardId,
+          rewardName: card.name || ""
+        }
+      );
+    });
+
+    res.json({
+      success: true,
+      message: "Código entregado correctamente",
+      name: deliveredName,
+      code: deliveredCode
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(400).json({
+      success: false,
+      message: error.message
+    });
+  }
+});
+
+/* =========================
+   ADMIN: WITHDRAWALS
+========================= */
+
+app.post("/api/admin/withdrawals/list", verifyUser, verifyAdmin, async (req, res) => {
+  try {
+    const snap = await db
+      .collection("withdrawals")
+      .orderBy("createdAt", "desc")
+      .limit(100)
+      .get();
+
+    const withdrawals = snap.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
+
+    res.json({
+      success: true,
+      withdrawals
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      success: false,
+      message: "Error cargando solicitudes"
+    });
+  }
+});
+
+app.post("/api/admin/withdraw/paid", verifyUser, verifyAdmin, async (req, res) => {
+  try {
     const withdrawId = String(req.body.withdrawId || "").trim();
 
     if (!withdrawId) {
       return res.status(400).json({
         success: false,
         message: "Falta withdrawId"
-      });
-    }
-
-    const adminSnap = await db.collection("users").doc(uid).get();
-
-    if (!adminSnap.exists || !adminSnap.data().isAdmin) {
-      return res.status(403).json({
-        success: false,
-        message: "No eres admin"
       });
     }
 
@@ -505,6 +652,245 @@ app.post("/api/admin/withdraw/paid", verifyUser, async (req, res) => {
     res.status(400).json({
       success: false,
       message: "Error marcando pagado"
+    });
+  }
+});
+
+/* =========================
+   ADMIN: GIFTCARDS
+========================= */
+
+app.post("/api/admin/giftcards/add", verifyUser, verifyAdmin, async (req, res) => {
+  try {
+    const type = String(req.body.type || "").trim();
+    const name = String(req.body.name || "").trim();
+    const coinsCost = Number(req.body.coinsCost || 0);
+    const value = String(req.body.value || "").trim();
+    const country = String(req.body.country || "MX").trim().toUpperCase();
+    const code = String(req.body.code || "").trim();
+
+    if (!type || !name || !coinsCost || !value || !country || !code) {
+      return res.status(400).json({
+        success: false,
+        message: "Faltan datos"
+      });
+    }
+
+    await db.collection("giftcards").add({
+      type,
+      name,
+      coinsCost,
+      value,
+      country,
+      code,
+      used: false,
+      usedBy: null,
+      usedByEmail: null,
+      usedAt: null,
+      createdAt: FieldValue.serverTimestamp()
+    });
+
+    res.json({
+      success: true,
+      message: "Gift card guardada"
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      success: false,
+      message: "Error guardando gift card"
+    });
+  }
+});
+
+app.post("/api/admin/giftcards/bulk-add", verifyUser, verifyAdmin, async (req, res) => {
+  try {
+    const type = String(req.body.type || "").trim();
+    const name = String(req.body.name || "").trim();
+    const coinsCost = Number(req.body.coinsCost || 0);
+    const value = String(req.body.value || "").trim();
+    const country = String(req.body.country || "MX").trim().toUpperCase();
+    const codes = Array.isArray(req.body.codes) ? req.body.codes : [];
+
+    const cleanCodes = codes
+      .map(code => String(code || "").trim())
+      .filter(Boolean);
+
+    if (!type || !name || !coinsCost || !value || !country || cleanCodes.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Faltan datos"
+      });
+    }
+
+    const batch = db.batch();
+
+    cleanCodes.forEach(code => {
+      const ref = db.collection("giftcards").doc();
+
+      batch.set(ref, {
+        type,
+        name,
+        coinsCost,
+        value,
+        country,
+        code,
+        used: false,
+        usedBy: null,
+        usedByEmail: null,
+        usedAt: null,
+        createdAt: FieldValue.serverTimestamp()
+      });
+    });
+
+    await batch.commit();
+
+    res.json({
+      success: true,
+      message: `${cleanCodes.length} códigos guardados`
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      success: false,
+      message: "Error importando códigos"
+    });
+  }
+});
+
+app.post("/api/admin/giftcards/list", verifyUser, verifyAdmin, async (req, res) => {
+  try {
+    const snap = await db
+      .collection("giftcards")
+      .orderBy("createdAt", "desc")
+      .limit(200)
+      .get();
+
+    const giftcards = snap.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
+
+    res.json({
+      success: true,
+      giftcards
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      success: false,
+      message: "Error cargando gift cards"
+    });
+  }
+});
+
+/* =========================
+   ADMIN: USERS
+========================= */
+
+app.post("/api/admin/users/list", verifyUser, verifyAdmin, async (req, res) => {
+  try {
+    const snap = await db
+      .collection("users")
+      .orderBy("createdAt", "desc")
+      .limit(200)
+      .get();
+
+    const users = snap.docs.map(doc => ({
+      id: doc.id,
+      uid: doc.id,
+      ...doc.data()
+    }));
+
+    res.json({
+      success: true,
+      users
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      success: false,
+      message: "Error cargando usuarios"
+    });
+  }
+});
+
+app.post("/api/admin/users/history", verifyUser, verifyAdmin, async (req, res) => {
+  try {
+    const targetUid = String(req.body.uid || "").trim();
+
+    if (!targetUid) {
+      return res.status(400).json({
+        success: false,
+        message: "Falta uid"
+      });
+    }
+
+    const snap = await db
+      .collection("transactions")
+      .where("uid", "==", targetUid)
+      .orderBy("createdAt", "desc")
+      .limit(100)
+      .get();
+
+    const history = snap.docs.map(doc => ({
+      id: doc.id,
+      ...doc.data()
+    }));
+
+    res.json({
+      success: true,
+      history
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      success: false,
+      message: "Error cargando historial"
+    });
+  }
+});
+
+/* =========================
+   PÚBLICO: VER RECOMPENSAS DISPONIBLES
+========================= */
+
+app.post("/api/rewards/list", verifyUser, async (req, res) => {
+  try {
+    const snap = await db
+      .collection("giftcards")
+      .where("used", "==", false)
+      .limit(100)
+      .get();
+
+    const rewards = snap.docs.map(doc => {
+      const data = doc.data();
+
+      return {
+        id: doc.id,
+        type: data.type,
+        name: data.name,
+        value: data.value,
+        country: data.country,
+        coinsCost: data.coinsCost
+      };
+    });
+
+    res.json({
+      success: true,
+      rewards
+    });
+  } catch (error) {
+    console.error(error);
+
+    res.status(500).json({
+      success: false,
+      message: "Error cargando recompensas"
     });
   }
 });
