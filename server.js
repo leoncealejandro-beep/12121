@@ -863,25 +863,31 @@ app.post("/api/admin/users/history", verifyUser, verifyAdmin, async (req, res) =
     const snap = await db
       .collection("transactions")
       .where("uid", "==", targetUid)
-      .orderBy("createdAt", "desc")
-      .limit(100)
       .get();
 
-    const history = snap.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data()
-    }));
+    const history = snap.docs
+      .map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }))
+      .sort((a, b) => {
+        const ta = a.createdAt?.seconds || a.createdAt?._seconds || 0;
+        const tb = b.createdAt?.seconds || b.createdAt?._seconds || 0;
+        return tb - ta;
+      })
+      .slice(0, 100);
 
     res.json({
       success: true,
       history
     });
+
   } catch (error) {
-    console.error(error);
+    console.error("ERROR /api/admin/users/history:", error);
 
     res.status(500).json({
       success: false,
-      message: "Error cargando historial"
+      message: error.message || "Error cargando historial"
     });
   }
 });
