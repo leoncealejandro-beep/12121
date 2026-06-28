@@ -512,8 +512,38 @@ app.post("/api/rewards/redeem-code", verifyUser, async (req, res) => {
       });
     }
 
+    const parts = rewardId.split("|");
+
+    if (parts.length < 5) {
+      return res.status(400).json({
+        success: false,
+        message: "Recompensa inválida"
+      });
+    }
+
+    const [type, name, value, coinsCostRaw, country] = parts;
+    const coinsCost = Number(coinsCostRaw || 0);
+
+    const cardsSnap = await db
+      .collection("giftcards")
+      .where("used", "==", false)
+      .where("type", "==", type)
+      .where("name", "==", name)
+      .where("value", "==", value)
+      .where("coinsCost", "==", coinsCost)
+      .where("country", "==", country)
+      .limit(1)
+      .get();
+
+    if (cardsSnap.empty) {
+      return res.status(400).json({
+        success: false,
+        message: "Ya no hay códigos disponibles para esta recompensa"
+      });
+    }
+
+    const cardRef = cardsSnap.docs[0].ref;
     const userRef = db.collection("users").doc(uid);
-    const cardRef = db.collection("giftcards").doc(rewardId);
 
     let deliveredCode = null;
     let deliveredName = null;
@@ -534,7 +564,6 @@ app.post("/api/rewards/redeem-code", verifyUser, async (req, res) => {
       const coins = Number(user.coins || 0);
       const cost = Number(card.coinsCost || 0);
 
-      if (!cost || cost < 1) throw new Error("Costo inválido");
       if (coins < cost) throw new Error("No tienes monedas suficientes");
 
       deliveredCode = card.code;
@@ -556,7 +585,7 @@ app.post("/api/rewards/redeem-code", verifyUser, async (req, res) => {
       tx.set(redeemRef, {
         uid,
         email: user.email || "",
-        giftcardId: rewardId,
+        giftcardId: cardSnap.id,
         type: card.type || "",
         name: card.name || "",
         value: card.value || "",
@@ -573,7 +602,7 @@ app.post("/api/rewards/redeem-code", verifyUser, async (req, res) => {
         -cost,
         "giftcard",
         {
-          giftcardId: rewardId,
+          giftcardId: cardSnap.id,
           rewardName: card.name || ""
         }
       );
@@ -585,6 +614,7 @@ app.post("/api/rewards/redeem-code", verifyUser, async (req, res) => {
       name: deliveredName,
       code: deliveredCode
     });
+
   } catch (error) {
     console.error(error);
 
@@ -862,29 +892,40 @@ app.post("/api/admin/users/history", verifyUser, verifyAdmin, async (req, res) =
 
 app.post("/api/rewards/list", verifyUser, async (req, res) => {
   try {
+    const allowedTypes = ["paypal", "google_play", "free_fire"];
+
     const snap = await db
       .collection("giftcards")
       .where("used", "==", false)
-      .limit(100)
+      .limit(500)
       .get();
 
-    const rewards = snap.docs.map(doc => {
-      const data = doc.data();
+    const unique = new Map();
 
-      return {
-        id: doc.id,
-        type: data.type,
-        name: data.name,
-        value: data.value,
-        country: data.country,
-        coinsCost: data.coinsCost
-      };
+    snap.docs.forEach(docSnap => {
+      const data = docSnap.data();
+
+      if (!allowedTypes.includes(data.type)) return;
+
+      const key = `${data.type}|${data.name}|${data.value}|${data.coinsCost}|${data.country}`;
+
+      if (!unique.has(key)) {
+        unique.set(key, {
+          id: key,
+          type: data.type,
+          name: data.name,
+          value: data.value,
+          country: data.country,
+          coinsCost: data.coinsCost
+        });
+      }
     });
 
     res.json({
       success: true,
-      rewards
+      rewards: Array.from(unique.values())
     });
+
   } catch (error) {
     console.error(error);
 
